@@ -9,12 +9,12 @@ from langgraph.graph.state import CompiledStateGraph
 
 def reset_db(db_path: str, echo: bool = False):
     """Drops the existing database file and recreates all tables."""
-    
+
     # Remove the file if it exists
     if os.path.exists(db_path):
         os.remove(db_path)
         print(f"✅ Removed existing {db_path}")
-    
+
     # Note: Table creation is handled by the specific model's Base.metadata.create_all()
     # This function just removes the file
     print(f"✅ Database file removed: {db_path}")
