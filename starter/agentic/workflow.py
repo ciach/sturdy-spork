@@ -18,6 +18,9 @@ from agentic.agents.resolver import ResolverAgent
 from agentic.agents.tool_agent import ToolAgent
 from agentic.agents.escalation import EscalationAgent
 
+# Import memory manager
+from agentic.tools.memory_manager import get_memory_manager
+
 
 # Define the state schema
 class AgentState(TypedDict):
@@ -25,6 +28,7 @@ class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
     ticket_id: str
     user_id: Optional[str]
+    customer_id: Optional[str]  # For persistent memory
     classification: Optional[Dict[str, Any]]
     knowledge_results: Optional[Dict[str, Any]]
     tool_results: Optional[List[Dict[str, Any]]]
@@ -33,6 +37,7 @@ class AgentState(TypedDict):
     escalation_needed: bool
     resolution: Optional[str]
     escalation_data: Optional[Dict[str, Any]]
+    customer_history: Optional[List[Dict[str, Any]]]  # Historical interactions
 
 
 # Initialize agents
@@ -120,12 +125,14 @@ def resolver_node(state: AgentState) -> AgentState:
     if not user_message:
         return state
     
-    # Prepare context
+    # Prepare context with customer history
     context = {}
     if state.get("tool_results"):
         context["tool_results"] = state["tool_results"]
     if state.get("user_id"):
         context["user_id"] = state["user_id"]
+    if state.get("customer_history"):
+        context["customer_history"] = state["customer_history"]
     
     # Attempt resolution
     result = resolver.resolve(
@@ -311,6 +318,81 @@ def escalation_node(state: AgentState) -> AgentState:
     }
 
 
+def load_customer_history_node(state: AgentState) -> AgentState:
+    """
+    Load customer interaction history for personalization.
+    """
+    customer_id = state.get("customer_id") or state.get("user_id")
+    
+    if not customer_id:
+        return state
+    
+    try:
+        memory_mgr = get_memory_manager()
+        
+        # Get customer history
+        history = memory_mgr.get_customer_history(customer_id, limit=3, include_messages=True)
+        
+        # Get customer preferences
+        preferences = memory_mgr.get_customer_preferences(customer_id)
+        
+        state["customer_history"] = history
+        
+        # Add context message if returning customer
+        if preferences.get("is_returning_customer"):
+            context_msg = AIMessage(
+                content=f"[Customer Context: Returning customer with {preferences['total_interactions']} previous interactions. Most common category: {preferences.get('most_common_category', 'N/A')}]",
+                name="memory_system"
+            )
+            return {
+                **state,
+                "messages": [context_msg]
+            }
+    except Exception as e:
+        print(f"Error loading customer history: {e}")
+    
+    return state
+
+
+def save_interaction_node(state: AgentState) -> AgentState:
+    """
+    Save interaction to persistent database.
+    """
+    # Get ticket_id from state or generate from thread_id
+    ticket_id = state.get("ticket_id")
+    if not ticket_id:
+        # Generate ticket_id from thread config if not provided
+        import uuid
+        ticket_id = f"ticket_{uuid.uuid4().hex[:12]}"
+        state["ticket_id"] = ticket_id
+    
+    customer_id = state.get("customer_id") or state.get("user_id")
+    messages = state.get("messages", [])
+    classification = state.get("classification")
+    
+    # Determine resolution status
+    if state.get("escalation_needed") or state.get("escalation_data"):
+        status = "escalated"
+    elif state.get("resolution"):
+        status = "resolved"
+    else:
+        status = "open"
+    
+    try:
+        memory_mgr = get_memory_manager()
+        memory_mgr.save_interaction(
+            ticket_id=ticket_id,
+            customer_id=customer_id,
+            messages=messages,
+            classification=classification,
+            resolution_status=status
+        )
+    except Exception as e:
+        print(f"Error saving interaction: {e}")
+    
+    return state
+
+
 def route_after_supervisor(state: AgentState) -> str:
     """
     Routing function after supervisor decision.
@@ -332,14 +414,19 @@ def create_workflow():
     workflow = StateGraph(AgentState)
     
     # Add nodes
+    workflow.add_node("load_history", load_customer_history_node)
     workflow.add_node("supervisor", supervisor_node)
     workflow.add_node("classifier", classifier_node)
     workflow.add_node("resolver", resolver_node)
     workflow.add_node("tool", tool_node)
     workflow.add_node("escalation", escalation_node)
+    workflow.add_node("save_interaction", save_interaction_node)
     
-    # Set entry point
-    workflow.set_entry_point("supervisor")
+    # Set entry point - load history first
+    workflow.set_entry_point("load_history")
+    
+    # Load history then go to supervisor
+    workflow.add_edge("load_history", "supervisor")
     
     # Add edges from supervisor to agents
     workflow.add_conditional_edges(
@@ -350,7 +437,7 @@ def create_workflow():
             "resolver": "resolver",
             "tool": "tool",
             "escalation": "escalation",
-            END: END
+            END: "save_interaction"  # Save before ending
         }
     )
     
@@ -358,7 +445,10 @@ def create_workflow():
     workflow.add_edge("classifier", "supervisor")
     workflow.add_edge("resolver", "supervisor")
     workflow.add_edge("tool", "supervisor")
-    workflow.add_edge("escalation", END)
+    workflow.add_edge("escalation", "save_interaction")
+    
+    # Save interaction then end
+    workflow.add_edge("save_interaction", END)
     
     # Setup memory with SQLite checkpointer
     memory_path = os.path.join(

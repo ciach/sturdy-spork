@@ -82,13 +82,22 @@ Do not mention "knowledge base" or "articles" in your response - just provide th
             user_message = f"Customer Question: {query}\n\n"
             
             if context:
+                # Add customer history for personalization
+                if context.get("customer_history"):
+                    history = context["customer_history"]
+                    if history:
+                        user_message += f"Customer History: This customer has {len(history)} previous interactions.\n"
+                        # Add most recent issue
+                        recent = history[0]
+                        user_message += f"Most recent: {recent.get('category', 'N/A')} - {recent.get('subject', 'N/A')}\n\n"
+                
                 if context.get("user_info"):
                     user_message += f"User Info: {context['user_info']}\n"
                 if context.get("tool_results"):
                     user_message += f"Additional Info: {context['tool_results']}\n"
             
             user_message += f"\nRelevant Knowledge Articles:\n{articles_text}\n\n"
-            user_message += "Provide a helpful response based on the articles above."
+            user_message += "Provide a helpful, personalized response based on the articles above and customer history."
             
             # Generate response
             messages = [
